@@ -61,7 +61,13 @@ async def async_main() -> int:
                 print(f"Session expired during fetch, refreshing "
                       f"(attempt {fetch_attempt + 1}/6)...", flush=True)
                 await asyncio.sleep(2)
-                creds = await browser.refresh_credentials()
+                try:
+                    creds = await browser.refresh_credentials()
+                except Exception as e:
+                    # A failed refresh is just a failed attempt - keep the loop
+                    # going instead of aborting the whole run.
+                    print(f"  Refresh failed: {e}", flush=True)
+                    await asyncio.sleep(5)
         if item_ids is None:
             print("\nCould not keep a valid session while listing files.")
             print("Progress is checkpointed - just run again to resume.")
