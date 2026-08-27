@@ -52,13 +52,20 @@ async def async_main() -> int:
 
         checkpoint_file = Path("icloud_restore_checkpoint.json")
 
-        try:
-            item_ids = await fetch_deleted_files(creds, checkpoint_file)
-        except AuthExpiredError:
-            # Try refreshing credentials once
-            print("Session expired during fetch, refreshing...")
-            creds = await browser.refresh_credentials()
-            item_ids = await fetch_deleted_files(creds, checkpoint_file)
+        item_ids = None
+        for fetch_attempt in range(6):
+            try:
+                item_ids = await fetch_deleted_files(creds, checkpoint_file)
+                break
+            except AuthExpiredError:
+                print(f"Session expired during fetch, refreshing "
+                      f"(attempt {fetch_attempt + 1}/6)...", flush=True)
+                await asyncio.sleep(2)
+                creds = await browser.refresh_credentials()
+        if item_ids is None:
+            print("\nCould not keep a valid session while listing files.")
+            print("Progress is checkpointed - just run again to resume.")
+            return 1
 
         if not item_ids:
             print("\nNo deleted files found!")

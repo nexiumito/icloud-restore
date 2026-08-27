@@ -21,6 +21,7 @@ class Credentials:
     dsid: str
     client_build_number: str = "2546Build54"
     client_mastering_number: str = "2546Build54"
+    api_base: str | None = None  # Real docws host for this account
 
 
 def _get_chrome_path() -> str | None:
@@ -121,6 +122,7 @@ class ICloudBrowser:
         self._credentials: Credentials | None = None
         self._login_event = asyncio.Event()
         self._temp_profile: str | None = None
+        self._api_base: str | None = None
 
     async def connect(self) -> bool:
         """Launch Chrome and connect via remote debugging.
@@ -162,17 +164,23 @@ class ICloudBrowser:
         pages = self._context.pages
 
         if not pages:
-            # Create a new page if none exist
             self._page = await self._context.new_page()
-            await self._page.goto(ICLOUD_RECOVERY_URL)
         else:
             self._page = pages[0]
-            # Navigate to iCloud if not already there
-            if "icloud.com" not in self._page.url:
-                await self._page.goto(ICLOUD_RECOVERY_URL)
 
-        # Set up request listener to detect login
+        # Listener must be armed BEFORE navigating, or we miss the auth requests.
         self._page.on("request", self._handle_request)
+
+        # Always (re)load the recovery page. When re-attaching to a Chrome that
+        # is already logged in, an idle tab fires no requests, so credentials
+        # would never be detected.
+        try:
+            if "icloud.com" in self._page.url:
+                await self._page.reload(wait_until="domcontentloaded")
+            else:
+                await self._page.goto(ICLOUD_RECOVERY_URL, wait_until="domcontentloaded")
+        except Exception:
+            pass
 
         print(f"Connected to Chrome: {self._page.url}")
         return True
@@ -180,6 +188,12 @@ class ICloudBrowser:
     def _handle_request(self, request) -> None:
         """Watch for iCloud API requests that indicate successful login."""
         url = request.url
+
+        # Capture the account's real docws server pool. Apple shards accounts
+        # across pools (p107, p143, ...); hitting the wrong one returns HTTP 421.
+        netloc = urlparse(url).netloc
+        if "docws.icloud.com" in netloc:
+            self._api_base = f"https://{netloc}"
 
         # Look for authenticated API requests (contain clientId and dsid)
         if "icloud.com" in url and "clientId=" in url and "dsid=" in url:
@@ -222,13 +236,25 @@ class ICloudBrowser:
             raise TimeoutError(f"Login not detected within {timeout} seconds")
 
         # Extract cookies from browser context
+        await self._wait_for_api_base()
         await self._extract_cookies()
+
+        if self._api_base:
+            print(f"  api host: {self._api_base}")
+        else:
+            print("  api host: not observed, falling back to default pool")
 
         print(f"Login detected!")
         print(f"  dsid: {self._credentials.dsid}")
         print(f"  clientId: {self._credentials.client_id[:20]}...")
 
         return self._credentials
+
+    async def _wait_for_api_base(self, timeout: float = 20) -> None:
+        """Give the page a moment to hit docws so we learn the account's pool."""
+        deadline = asyncio.get_event_loop().time() + timeout
+        while self._api_base is None and asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(0.5)
 
     async def _extract_cookies(self) -> None:
         """Extract cookies from browser context and update credentials."""
@@ -237,6 +263,7 @@ class ICloudBrowser:
 
         if self._credentials:
             self._credentials.cookies = cookie_string
+            self._credentials.api_base = self._api_base
 
     async def refresh_credentials(self) -> Credentials:
         """Reload page to get fresh credentials.
@@ -262,6 +289,7 @@ class ICloudBrowser:
             raise TimeoutError("Failed to refresh credentials - no API requests detected")
 
         # Extract fresh cookies
+        await self._wait_for_api_base(timeout=10)
         await self._extract_cookies()
 
         print(f"  Credentials refreshed (clientId: {self._credentials.client_id[:20]}...)")
@@ -273,14 +301,14 @@ class ICloudBrowser:
         return self._credentials
 
     async def close(self) -> None:
-        """Close the browser connection and clean up temp profile."""
-        if self._browser:
-            await self._browser.close()
+        """Disconnect. Only tear down Chrome if we were the ones who launched it."""
+        try:
+            if self._browser and self._temp_profile:
+                await self._browser.close()
+        except Exception:
+            pass
         if self._playwright:
             await self._playwright.stop()
 
-        # Clean up temp profile directory
-        if self._temp_profile:
-            import shutil
-            shutil.rmtree(self._temp_profile, ignore_errors=True)
-            self._temp_profile = None
+        # Deliberately NOT removing the temp profile: Chrome may still be
+        # running and holding a logged-in session we want to reuse on rerun.

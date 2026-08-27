@@ -19,7 +19,10 @@ BASE_URL = "https://p107-docws.icloud.com"
 # Tuning parameters
 RESTORE_BATCH_SIZE = 100   # Files per restore request
 CONCURRENT_RESTORES = 5    # Parallel restore requests
-FETCH_PAGE_SIZE = 2000     # Files per list request
+FETCH_PAGE_SIZE = 50       # Apple's nextPage cursor advances 50 at a time regardless
+                           # of limit, so >50 just re-sends items we already have.
+FETCH_MIN_PAGE_SIZE = 50   # Floor when adaptively shrinking after 5xx
+FETCH_MAX_RETRIES = 8      # Retries per list page
 MAX_RETRIES = 5            # Retries per batch
 RETRY_DELAY = 2            # Base delay (exponential backoff)
 
@@ -103,37 +106,82 @@ async def fetch_deleted_files(
         except (json.JSONDecodeError, KeyError):
             pass
 
+    # Apple's tombstone pagination returns overlapping items across pages,
+    # so track a seen-set and keep all_item_ids unique (order preserved).
+    seen_ids = set(all_item_ids)
+    if len(seen_ids) != len(all_item_ids):
+        all_item_ids[:] = list(dict.fromkeys(all_item_ids))
+        seen_ids = set(all_item_ids)
+        print(f"  Deduplicated checkpoint to {len(all_item_ids)} unique IDs")
+
     cookies = _parse_cookies(creds.cookies)
+    page_size = FETCH_PAGE_SIZE
 
     async with httpx.AsyncClient(cookies=cookies, timeout=60.0) as client:
         while True:
             page += 1
-            params = {
-                **_get_params(creds),
-                "limit": str(FETCH_PAGE_SIZE),
-                "unified_format": "true",
-            }
-            if continuation_marker:
-                params["nextPage"] = continuation_marker
-
-            url = f"{BASE_URL}/ws/_all_/list/enumerate/tombstones?{urlencode(params)}"
-
             print(f"  Page {page}...", end=" ", flush=True)
 
-            try:
-                response = await client.get(url, headers=_get_headers())
-                response.raise_for_status()
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code in (401, 403, 421):
-                    raise AuthExpiredError(f"Auth expired (HTTP {e.response.status_code})")
-                raise
+            attempt = 0
+            data = None
 
-            data = response.json()
+            while True:
+                params = {
+                    **_get_params(creds),
+                    "limit": str(page_size),
+                    "unified_format": "true",
+                }
+                if continuation_marker:
+                    params["nextPage"] = continuation_marker
+
+                base = creds.api_base or BASE_URL
+                url = f"{base}/ws/_all_/list/enumerate/tombstones?{urlencode(params)}"
+
+                try:
+                    response = await client.get(url, headers=_get_headers())
+                    response.raise_for_status()
+                    data = response.json()
+                    break
+
+                except httpx.HTTPStatusError as e:
+                    code = e.response.status_code
+                    if code in (401, 403, 421):
+                        raise AuthExpiredError(f"Auth expired (HTTP {code})")
+
+                    attempt += 1
+                    if code >= 500 and attempt <= FETCH_MAX_RETRIES:
+                        # Apple 500s on this endpoint when the page is too big.
+                        # Back off, and shrink the window if it keeps failing.
+                        if attempt >= 2 and page_size > FETCH_MIN_PAGE_SIZE:
+                            page_size = max(FETCH_MIN_PAGE_SIZE, page_size // 2)
+                            print(f"\n    HTTP {code} - shrinking page size to {page_size}",
+                                  end=" ", flush=True)
+                        delay = min(RETRY_DELAY * (2 ** attempt), 60)
+                        print(f"\n    HTTP {code} - retry {attempt}/{FETCH_MAX_RETRIES} in {delay}s",
+                              end=" ", flush=True)
+                        await asyncio.sleep(delay)
+                        continue
+                    raise
+
+                except (httpx.TimeoutException, httpx.TransportError) as e:
+                    attempt += 1
+                    if attempt <= FETCH_MAX_RETRIES:
+                        delay = min(RETRY_DELAY * (2 ** attempt), 60)
+                        print(f"\n    {type(e).__name__} - retry {attempt}/{FETCH_MAX_RETRIES} in {delay}s",
+                              end=" ", flush=True)
+                        await asyncio.sleep(delay)
+                        continue
+                    raise
+
             documents = data.get("documents", [])
-            item_ids = [doc["item_id"] for doc in documents if "item_id" in doc]
-            all_item_ids.extend(item_ids)
+            new_ids = [doc["item_id"] for doc in documents
+                       if "item_id" in doc and doc["item_id"] not in seen_ids]
+            seen_ids.update(new_ids)
+            all_item_ids.extend(new_ids)
 
-            print(f"{len(documents)} files (total: {len(all_item_ids)})")
+            dupes = len(documents) - len(new_ids)
+            suffix = f", {dupes} dup" if dupes else ""
+            print(f"{len(documents)} files{suffix} (unique total: {len(all_item_ids)})", flush=True)
 
             # Save checkpoint
             continuation_marker = data.get("continuationMarker")
@@ -180,7 +228,8 @@ async def restore_files(
         except (json.JSONDecodeError, KeyError):
             pass
 
-    # Filter out already restored
+    # Filter out already restored, and never queue the same id twice
+    item_ids = list(dict.fromkeys(item_ids))
     restored_set = set(restored_ids)
     remaining_ids = [id for id in item_ids if id not in restored_set]
 
@@ -205,21 +254,45 @@ async def restore_files(
     save_counter = 0
     start_time = time.time()
 
+    refresh_lock = asyncio.Lock()
+    creds_generation = 0
+    MAX_AUTH_REFRESH = 4
+
+    async def get_refreshed(seen_generation: int):
+        """Serialize credential refresh so 5 concurrent 401s cause 1 reload."""
+        nonlocal current_creds, creds_generation
+        async with refresh_lock:
+            if creds_generation != seen_generation:
+                # Another task already refreshed; reuse its result.
+                return current_creds, creds_generation
+            current_creds = await on_auth_expired()
+            creds_generation += 1
+            return current_creds, creds_generation
+
     async def restore_batch(batch: list[str], batch_num: int) -> None:
-        nonlocal current_creds, save_counter
+        nonlocal save_counter
 
         async with semaphore:
-            cookies = _parse_cookies(current_creds.cookies)
+            creds_now = current_creds
+            my_generation = creds_generation
+            cookies = _parse_cookies(creds_now.cookies)
 
             async with httpx.AsyncClient(cookies=cookies, timeout=60.0) as client:
-                url = f"{BASE_URL}/v1/items?{urlencode(_get_params(current_creds))}"
+                def build_url():
+                    base = creds_now.api_base or BASE_URL
+                    return f"{base}/v1/items?{urlencode(_get_params(creds_now))}"
+
+                url = build_url()
                 payload = {
                     "drive_item_update_request": {"is_recover": "true"},
                     "item_ids": batch,
                 }
 
                 completed = False
-                for attempt in range(MAX_RETRIES):
+                attempt = 0
+                auth_refreshes = 0
+
+                while attempt < MAX_RETRIES:
                     try:
                         response = await client.put(
                             url, headers=_get_headers(), json=payload
@@ -235,69 +308,82 @@ async def restore_files(
                             status_msg = items_status[0].get("status_message", "")
 
                             if str(status_code) != "200":
-                                if attempt < MAX_RETRIES - 1:
+                                attempt += 1
+                                if attempt < MAX_RETRIES:
                                     delay = RETRY_DELAY * (2 ** attempt)
-                                    print(f"  Batch {batch_num}/{total_batches}: {status_code} - retry in {delay}s")
+                                    print(f"  Batch {batch_num}/{total_batches}: {status_code} - retry in {delay}s", flush=True)
                                     await asyncio.sleep(delay)
                                     continue
-                                else:
-                                    stats.failed += len(batch)
-                                    stats.failed_ids.extend(batch)
-                                    print(f"  Batch {batch_num}/{total_batches}: FAILED - {status_msg[:50]}")
-                                    return
+                                stats.failed += len(batch)
+                                stats.failed_ids.extend(batch)
+                                print(f"  Batch {batch_num}/{total_batches}: FAILED - {status_msg[:50]}", flush=True)
+                                return
 
                         # Success
                         stats.restored += len(batch)
                         async with lock:
                             restored_ids.extend(batch)
-                        print(f"  Batch {batch_num}/{total_batches}: OK ({stats.restored} restored)")
+                        print(f"  Batch {batch_num}/{total_batches}: OK ({stats.restored} restored)", flush=True)
                         completed = True
                         break
 
                     except httpx.HTTPStatusError as e:
                         if e.response.status_code in (401, 403, 421):
-                            print(f"\n  Auth expired (HTTP {e.response.status_code})")
-                            # Refresh credentials
-                            current_creds = await on_auth_expired()
-                            # Rebuild client with new cookies
-                            cookies = _parse_cookies(current_creds.cookies)
+                            # Auth refresh does NOT consume a retry attempt.
+                            auth_refreshes += 1
+                            if auth_refreshes > MAX_AUTH_REFRESH:
+                                stats.failed += len(batch)
+                                stats.failed_ids.extend(batch)
+                                print(f"  Batch {batch_num}/{total_batches}: FAILED - auth refresh exhausted", flush=True)
+                                return
+                            print(f"\n  Auth expired (HTTP {e.response.status_code})", flush=True)
+                            try:
+                                creds_now, my_generation = await get_refreshed(my_generation)
+                            except Exception as re:
+                                stats.failed += len(batch)
+                                stats.failed_ids.extend(batch)
+                                print(f"  Batch {batch_num}/{total_batches}: FAILED - refresh error: {re}", flush=True)
+                                return
+                            cookies = _parse_cookies(creds_now.cookies)
                             client.cookies.clear()
                             client.cookies.update(cookies)
-                            url = f"{BASE_URL}/v1/items?{urlencode(_get_params(current_creds))}"
+                            url = build_url()
                             continue
 
-                        if attempt < MAX_RETRIES - 1:
+                        attempt += 1
+                        if attempt < MAX_RETRIES:
                             delay = RETRY_DELAY * (2 ** attempt)
-                            print(f"  Batch {batch_num}/{total_batches}: HTTP {e.response.status_code} - retry in {delay}s")
+                            print(f"  Batch {batch_num}/{total_batches}: HTTP {e.response.status_code} - retry in {delay}s", flush=True)
                             await asyncio.sleep(delay)
                             continue
 
                         stats.failed += len(batch)
                         stats.failed_ids.extend(batch)
-                        print(f"  Batch {batch_num}/{total_batches}: FAILED - HTTP {e.response.status_code}")
+                        print(f"  Batch {batch_num}/{total_batches}: FAILED - HTTP {e.response.status_code}", flush=True)
                         return
 
                     except Exception as e:
-                        if attempt < MAX_RETRIES - 1:
+                        attempt += 1
+                        if attempt < MAX_RETRIES:
                             delay = RETRY_DELAY * (2 ** attempt)
-                            print(f"  Batch {batch_num}/{total_batches}: {type(e).__name__} - retry in {delay}s")
+                            print(f"  Batch {batch_num}/{total_batches}: {type(e).__name__} - retry in {delay}s", flush=True)
                             await asyncio.sleep(delay)
                             continue
 
                         stats.failed += len(batch)
                         stats.failed_ids.extend(batch)
-                        print(f"  Batch {batch_num}/{total_batches}: FAILED - {e}")
+                        print(f"  Batch {batch_num}/{total_batches}: FAILED - {e}", flush=True)
                         return
 
                 if not completed:
                     stats.failed += len(batch)
                     stats.failed_ids.extend(batch)
-                    print(f"  Batch {batch_num}/{total_batches}: FAILED - auth refresh exhausted")
+                    print(f"  Batch {batch_num}/{total_batches}: FAILED - retries exhausted", flush=True)
                     return
 
             # Save progress periodically
             save_counter += 1
-            if save_counter % 20 == 0:
+            if save_counter % 5 == 0:
                 async with lock:
                     progress_file.write_text(json.dumps({
                         "restored_ids": restored_ids,
@@ -315,7 +401,7 @@ async def restore_files(
                         print(f"\n  === Progress: {pct:.1f}% | "
                               f"Restored: {stats.restored} | "
                               f"Failed: {stats.failed} | "
-                              f"ETA: {eta_min:.1f}min ===\n")
+                              f"ETA: {eta_min:.1f}min ===\n", flush=True)
 
     # Run all batches
     tasks = [restore_batch(batch, i + 1) for i, batch in enumerate(batches)]

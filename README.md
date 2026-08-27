@@ -32,14 +32,26 @@ This tool bypasses the broken web UI by using Apple's API directly. It:
 
 ## Installation
 
+> **Note:** the package is not on PyPI yet, so `uvx icloud-restore` and
+> `pipx run icloud-restore` will fail with "no available version" (see #2).
+> Until it is published, install straight from this repository:
+
 ```bash
 # Using uv (recommended)
-uvx icloud-restore
+uvx --from git+https://github.com/odysseus0/icloud-restore icloud-restore
 
 # Using pipx
-pipx run icloud-restore
+pipx run --spec git+https://github.com/odysseus0/icloud-restore icloud-restore
 
 # Or install globally
+pip install git+https://github.com/odysseus0/icloud-restore
+```
+
+Once the package is published to PyPI, the shorter forms work:
+
+```bash
+uvx icloud-restore
+pipx run icloud-restore
 pip install icloud-restore
 ```
 
