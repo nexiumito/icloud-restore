@@ -99,8 +99,14 @@ You can leave it running unattended.
 ## Security
 
 - **Local only**: Your credentials never leave your machine
-- **No storage**: Cookies are not saved to disk (only held in memory during the session)
-- **Keychain works**: Fresh Chrome profile still has access to macOS Keychain for password autofill
+- **Not stored by the tool**: the Python process holds cookies in memory only; it never writes them out
+- **But Chrome does keep a session on disk**: the browser runs with a dedicated
+  profile at `$TMPDIR/icloud-restore-chrome-profile` (mode `0700`), and that profile
+  is intentionally kept between runs so a re-run can reattach to an
+  already-authenticated browser instead of asking for your Apple ID and 2FA again.
+  It is a single stable directory, not one per run. **Delete it to sign out and
+  clear the stored cookies** - the tool prints the path when it exits.
+- **Keychain works**: the dedicated Chrome profile still has access to macOS Keychain for password autofill
 - **Open source**: Review the code yourself
 
 ## Requirements

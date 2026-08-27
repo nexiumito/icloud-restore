@@ -1,8 +1,10 @@
 """Browser helpers for iCloud authentication via Chrome DevTools Protocol."""
 
 import asyncio
+import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from urllib.parse import parse_qs, urlparse
 
@@ -74,40 +76,58 @@ def _is_port_open(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
-def launch_chrome_with_debugging() -> str | None:
-    """Launch Chrome with remote debugging enabled using a fresh temp profile.
+def chrome_profile_dir() -> str:
+    """Stable Chrome profile used for the debugging session.
 
-    Chrome requires a non-default user-data-dir for remote debugging.
-    Keychain autofill still works since it's a system-level feature.
+    Chrome refuses remote debugging on the default profile, so we need a
+    separate user-data-dir. It is deliberately stable rather than a fresh
+    mkdtemp() per run: the browser is left alive between runs so a re-run can
+    reattach to an already-authenticated session, and Apple's tombstone
+    pagination is lossy enough that several runs are usually needed.
 
-    Returns:
-        Path to temp profile directory if launched (caller should clean up), None if failed
+    The trade-off is that the session cookies live on disk here between runs.
+    Delete this directory to sign out and remove them.
     """
     import tempfile
 
+    path = os.path.join(tempfile.gettempdir(), "icloud-restore-chrome-profile")
+    os.makedirs(path, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+    return path
+
+
+def launch_chrome_with_debugging() -> str | None:
+    """Launch Chrome with remote debugging enabled.
+
+    Keychain autofill still works since it's a system-level feature.
+
+    Returns:
+        Path to the profile directory if launched, None if failed
+    """
     chrome_path = _get_chrome_path()
     if not chrome_path:
         return None
 
-    # Create temp profile - Chrome requires non-default dir for debugging
-    temp_profile = tempfile.mkdtemp(prefix="icloud-restore-")
+    profile = chrome_profile_dir()
 
     try:
         subprocess.Popen(
             [
                 chrome_path,
                 "--remote-debugging-port=9222",
-                f"--user-data-dir={temp_profile}",
+                f"--user-data-dir={profile}",
                 "--no-first-run",
                 ICLOUD_RECOVERY_URL,
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        return temp_profile
-    except Exception:
-        import shutil
-        shutil.rmtree(temp_profile, ignore_errors=True)
+        return profile
+    except Exception as e:
+        print(f"Could not launch Chrome: {e}")
         return None
 
 
@@ -174,13 +194,17 @@ class ICloudBrowser:
         # Always (re)load the recovery page. When re-attaching to a Chrome that
         # is already logged in, an idle tab fires no requests, so credentials
         # would never be detected.
+        # A reload can legitimately raise when the page redirects mid-navigation,
+        # so this is not fatal - but it must not be silent either: if the page
+        # never loads, login detection just times out with a misleading message.
         try:
             if "icloud.com" in self._page.url:
                 await self._page.reload(wait_until="domcontentloaded")
             else:
                 await self._page.goto(ICLOUD_RECOVERY_URL, wait_until="domcontentloaded")
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Warning: could not load {ICLOUD_RECOVERY_URL}: {e}")
+            print("Continuing anyway - reload the page manually if login is not detected.")
 
         print(f"Connected to Chrome: {self._page.url}")
         return True
@@ -252,8 +276,8 @@ class ICloudBrowser:
 
     async def _wait_for_api_base(self, timeout: float = 20) -> None:
         """Give the page a moment to hit docws so we learn the account's pool."""
-        deadline = asyncio.get_event_loop().time() + timeout
-        while self._api_base is None and asyncio.get_event_loop().time() < deadline:
+        deadline = time.monotonic() + timeout
+        while self._api_base is None and time.monotonic() < deadline:
             await asyncio.sleep(0.5)
 
     async def _extract_cookies(self) -> None:
@@ -310,5 +334,10 @@ class ICloudBrowser:
         if self._playwright:
             await self._playwright.stop()
 
-        # Deliberately NOT removing the temp profile: Chrome may still be
-        # running and holding a logged-in session we want to reuse on rerun.
+        # Deliberately NOT removing the profile: Chrome is still running and
+        # holding a logged-in session we want to reuse on the next run. It is a
+        # single stable directory (see chrome_profile_dir), so it does not
+        # accumulate. Tell the user where it is so they can remove it.
+        if self._temp_profile:
+            print(f"\nChrome left running with profile: {self._temp_profile}")
+            print("Delete that directory to sign out and clear its stored cookies.")
