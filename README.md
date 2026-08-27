@@ -1,5 +1,16 @@
 # iCloud Restore
 
+> **This is a patched fork of [odysseus0/icloud-restore](https://github.com/odysseus0/icloud-restore).**
+> Upstream currently fails on the first API call for most accounts: it hardcodes one
+> Apple server pool (`p107`) and requests 2000 items per page, which returns HTTP 421
+> and HTTP 500 respectively. This fork fixes that plus lossy pagination and concurrent
+> credential refresh. Fixes submitted upstream as
+> [PR #5](https://github.com/odysseus0/icloud-restore/pull/5) /
+> [issue #4](https://github.com/odysseus0/icloud-restore/issues/4);
+> use this fork until they land.
+>
+> Verified on a real account: **39,165 files restored, 0 failures.**
+
 **Restore deleted files from iCloud Drive when the web UI fails.**
 
 ```bash
@@ -32,28 +43,23 @@ This tool bypasses the broken web UI by using Apple's API directly. It:
 
 ## Installation
 
-> **Note:** the package is not on PyPI yet, so `uvx icloud-restore` and
-> `pipx run icloud-restore` will fail with "no available version" (see #2).
-> Until it is published, install straight from this repository:
+> **Note:** this package is not on PyPI, so `uvx icloud-restore` and
+> `pipx run icloud-restore` fail with "no available version"
+> ([upstream issue #2](https://github.com/odysseus0/icloud-restore/issues/2)).
+> Install straight from this fork:
 
 ```bash
 # Using uv (recommended)
-uvx --from git+https://github.com/odysseus0/icloud-restore icloud-restore
+uvx --from git+https://github.com/nexiumito/icloud-restore icloud-restore
 
 # Using pipx
-pipx run --spec git+https://github.com/odysseus0/icloud-restore icloud-restore
+pipx run --spec git+https://github.com/nexiumito/icloud-restore icloud-restore
 
 # Or install globally
-pip install git+https://github.com/odysseus0/icloud-restore
+pip install git+https://github.com/nexiumito/icloud-restore
 ```
 
-Once the package is published to PyPI, the shorter forms work:
-
-```bash
-uvx icloud-restore
-pipx run icloud-restore
-pip install icloud-restore
-```
+Requires Python 3.10+ and Google Chrome.
 
 ## Usage
 
@@ -121,6 +127,42 @@ The tool should handle this automatically by refreshing credentials. If it keeps
 ### Some files failed to restore
 
 This can happen if Apple's servers are overloaded. Run the tool again - it will only retry the failed files.
+
+### One run is not enough - expect to run it several times
+
+Apple's tombstone pagination is *lossy*: a full pass does not necessarily return
+every deleted file. On a ~39k file account, a second pass surfaced 1,187 ids the
+first pass never returned. It took five passes to converge:
+
+| pass | genuinely new files restored |
+|---|---|
+| 1 | 37,740 |
+| 2 | 1,187 |
+| 3 | 32 |
+| 4 | 3 |
+| 5 | 0 |
+
+Keep re-running until a pass reports no new files. Progress is cumulative, so
+later passes are quick - they skip everything already restored.
+
+### iCloud still lists the files as deleted after a successful restore
+
+This is expected and is **not** a failure. Apple's "Recently Deleted" list stays
+stale for a long time after a restore: it kept reporting ~1,598 files as deleted
+on an account where every one of them was verified present on disk at its
+original path.
+
+Trust the local filesystem, not the recovery page's counter. Note that restored
+files can sit very deep - build caches like sbt's `target/streams/.../out` were
+16 directory levels down, so a shallow `find -maxdepth` will miss them and look
+like data loss when there is none.
+
+### Restored files are not on my Mac yet
+
+Restores put files back into iCloud Drive, not onto your disk directly. macOS then
+syncs them down lazily, which can take hours for large restores. Make sure the Mac
+stays awake (`caffeinate -dims`) and has enough free space - dependency folders
+like `node_modules` come back too.
 
 ## License
 
