@@ -9,7 +9,7 @@
 > [issue #4](https://github.com/odysseus0/icloud-restore/issues/4);
 > use this fork until they land.
 >
-> Verified on a real account: **39,165 files restored, 0 failures.**
+> Verified on a real account: **+100k files restored, 0 failures.**
 
 **Restore deleted files from iCloud Drive when the web UI fails.**
 
